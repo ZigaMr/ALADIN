@@ -7,6 +7,7 @@ import xml.etree.ElementTree as ET
 import cfgrib
 from sqlalchemy import create_engine, MetaData, Table, Column, Float, String, text, inspect, Float
 from datetime import datetime
+import datetime as dt
 import numpy as np
 
 try:
@@ -14,6 +15,13 @@ try:
 except ImportError:
     import findlibs
 
+def generate_datetime_list(start_datetime, end_datetime, interval_hours):
+    datetime_list = []
+    current_datetime = start_datetime
+    while current_datetime < end_datetime:
+        current_datetime += dt.timedelta(hours=interval_hours)
+        datetime_list.append(current_datetime)
+    return datetime_list
 
 class WeatherDataParser:
     def __init__(self,
@@ -147,21 +155,59 @@ class WeatherDataParser:
             conn.commit()
             locations.loc[len(locations)] = coords + [city]
         conn.close()
+
+        # Check for max_date in the database and download the latest missing data
+        insp = inspect(self.engine)
+        if insp.has_table('data0'):
+            with self.engine.connect() as connection:
+                max_date = connection.execute(text("""
+                                                    SELECT MAX(max_date) AS max_date
+                                                    FROM (
+                                                      SELECT MAX(time) AS max_date FROM data0
+                                                      UNION ALL
+                                                      SELECT MAX(time) AS max_date FROM data1
+                                                      UNION ALL
+                                                      SELECT MAX(time) AS max_date FROM data2
+                                                      UNION ALL
+                                                      SELECT MAX(time) AS max_date FROM data3
+                                                      UNION ALL
+                                                      SELECT MAX(time) AS max_date FROM data4
+                                                    ) AS max_dates;
+                                                    """)).all()[0][0]
+        else:
+            max_date = None
+
         # Get the current time
         current_time = datetime.now()
-        rounded_time = current_time.replace(hour=(current_time.hour // 6) * 6, minute=0, second=0, microsecond=0)
+        latest_time = current_time.replace(hour=(current_time.hour // 6) * 6,
+                                           minute=0,
+                                           second=0,
+                                           microsecond=0)
+        if max_date:
+            max_date = max(max_date, latest_time - dt.timedelta(hours=30))
+        else:
+            max_date = latest_time - dt.timedelta(hours=30)
+        dates_to_fill = generate_datetime_list(max_date, latest_time, 6)
+        for d in dates_to_fill:
+            print('Date: %s' % d)
+            url = self.zip_url.format(d.strftime('%Y%m%d-%H%M'))
+            data = self.download_and_read_grib_files(url)
+            if not data:
+                print('No data for: %s' % d)
+                continue
+            if 'weather_data' not in locals():
+                weather_data = data
+            else:
+                weather_data = list(map(pd.concat, zip(data, weather_data)))
 
-        url = self.zip_url.format(rounded_time.strftime('%Y%m%d-%H%M'))
-        weather_data = self.download_and_read_grib_files(url)
-        insp = inspect(self.engine)
+        if 'weather_data' not in locals():
+            return
+
         for ind, df in enumerate(weather_data):
             print('Inserting data: %s' % ind)
             # Check if table exists
             table_name = 'data' + str(ind)
-            if insp.has_table(table_name):
-                with self.engine.connect() as connection:
-                    max_date = connection.execute(text(f'select max(time) from {table_name}')).all()[0][0]
-                df = df[df.time > np.datetime64(max_date)]
+
             df_insert = df.reset_index()
             # Merge on latitude and longitude rounded to 1 decimal place
             df_insert = df_insert.merge(locations,
